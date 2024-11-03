@@ -12,10 +12,10 @@ from flask_socketio import SocketIO, emit
 from threading import Thread
 from datetime import datetime
 
-# Configure logging
+# Configure detailed logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.DEBUG,  # Set to DEBUG for more verbose logs
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,8 @@ socketio = SocketIO(
     logger=True,
     engineio_logger=True,
     ping_timeout=60,
-    ping_interval=25
+    ping_interval=25,
+    max_http_buffer_size=1e8
 )
 
 # Token configuration
@@ -49,46 +50,67 @@ TOKENS = {
 }
 
 class PriceTracker:
-    @staticmethod
-    def get_dexscreener_price(token_address):
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'application/json',
+            'Accept-Language': 'en-US,en;q=0.9',
+        })
+        self.last_prices = {}
+        
+    def get_dexscreener_price(self, token_address):
         """
         Get token price from DEXScreener with enhanced reliability
         """
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        })
-
         try:
             base_url = "https://api.dexscreener.com/latest/dex/tokens"
             url = f"{base_url}/{token_address}"
             
-            logger.info(f"Fetching DEXScreener data for {token_address}")
-            response = session.get(url, timeout=15)
-            response.raise_for_status()
+            logger.info(f"[DEXScreener] Fetching data for {token_address}")
+            logger.debug(f"[DEXScreener] Request URL: {url}")
             
+            # Log the request headers
+            logger.debug(f"[DEXScreener] Request headers: {dict(self.session.headers)}")
+            
+            response = self.session.get(url, timeout=15)
+            
+            # Log the response status and headers
+            logger.debug(f"[DEXScreener] Response status: {response.status_code}")
+            logger.debug(f"[DEXScreener] Response headers: {dict(response.headers)}")
+            
+            # Log the raw response
+            logger.debug(f"[DEXScreener] Raw response: {response.text[:500]}...")  # First 500 chars
+            
+            response.raise_for_status()
             data = response.json()
             
             if not data.get('pairs'):
-                logger.warning(f"No pairs found for {token_address}")
+                logger.warning(f"[DEXScreener] No pairs found for {token_address}")
+                # Return last known price if available
+                if token_address in self.last_prices:
+                    logger.info(f"[DEXScreener] Using last known price for {token_address}")
+                    return self.last_prices[token_address]
                 return None
-                
-            # Sort pairs by liquidity to get the most liquid pair
-            pairs = sorted(
-                [p for p in data['pairs'] if p.get('liquidity', {}).get('usd', 0) > 0],
-                key=lambda x: float(x.get('liquidity', {}).get('usd', 0)),
-                reverse=True
-            )
             
-            if not pairs:
-                logger.warning(f"No valid pairs found for {token_address}")
+            # Filter for valid pairs and sort by liquidity
+            valid_pairs = [
+                p for p in data['pairs']
+                if (p.get('liquidity', {}).get('usd', 0) > 0 and
+                    p.get('priceUsd') and
+                    float(p.get('priceUsd', 0)) > 0)
+            ]
+            
+            if not valid_pairs:
+                logger.warning(f"[DEXScreener] No valid pairs found for {token_address}")
                 return None
-                
-            # Get the most liquid pair
-            pair = pairs[0]
             
-            return {
-                'price': float(pair.get('priceUsd', 0)),
+            # Sort by liquidity
+            valid_pairs.sort(key=lambda x: float(x.get('liquidity', {}).get('usd', 0)), reverse=True)
+            pair = valid_pairs[0]
+            
+            price_data = {
+                'price': float(pair['priceUsd']),
                 'priceChange24h': float(pair.get('priceChange', {}).get('h24', 0)),
                 'volume24h': float(pair.get('volume', {}).get('h24', 0)),
                 'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
@@ -96,40 +118,53 @@ class PriceTracker:
                 'pairAddress': pair.get('pairAddress', '')
             }
             
+            # Store the last known good price
+            self.last_prices[token_address] = price_data
+            
+            logger.info(f"[DEXScreener] Successfully fetched price for {token_address}: ${price_data['price']:.8f}")
+            return price_data
+            
         except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed for {token_address}: {str(e)}")
+            logger.error(f"[DEXScreener] Request failed for {token_address}: {str(e)}")
+            # Return last known price if available
+            if token_address in self.last_prices:
+                logger.info(f"[DEXScreener] Using last known price for {token_address}")
+                return self.last_prices[token_address]
             return None
+            
         except Exception as e:
-            logger.error(f"Error processing data for {token_address}: {str(e)}")
+            logger.error(f"[DEXScreener] Error processing data for {token_address}: {str(e)}")
+            logger.exception("Detailed traceback:")
             return None
 
-    @staticmethod
-    def update_prices():
+    def update_prices(self):
         """
-        Continuous price update loop with retries
+        Continuous price update loop with retries and fallback
         """
+        retry_delays = [2, 4, 8]  # Progressive retry delays
+        
         while True:
             try:
                 prices = {}
                 total_value = 0
                 update_successful = False
+                successful_tokens = set()
 
                 for token_name, token_info in TOKENS.items():
-                    max_retries = 3
-                    retry_delay = 2
+                    logger.info(f"Processing {token_name}")
                     
-                    for attempt in range(max_retries):
+                    for attempt, delay in enumerate(retry_delays, 1):
                         try:
                             address = token_info['address']
                             holdings = token_info['holdings']
 
-                            logger.info(f"Fetching data for {token_name} (Attempt {attempt + 1}/{max_retries})")
-                            market_data = PriceTracker.get_dexscreener_price(address)
+                            logger.info(f"Fetching data for {token_name} (Attempt {attempt}/{len(retry_delays)})")
+                            market_data = self.get_dexscreener_price(address)
                             
                             if market_data is None:
-                                if attempt < max_retries - 1:
-                                    logger.info(f"Retrying {token_name} in {retry_delay} seconds...")
-                                    time.sleep(retry_delay)
+                                if attempt < len(retry_delays):
+                                    logger.info(f"Retrying {token_name} in {delay} seconds...")
+                                    time.sleep(delay)
                                     continue
                                 logger.error(f"All retries failed for {token_name}")
                                 break
@@ -138,6 +173,7 @@ class PriceTracker:
                             value = price * holdings
                             total_value += value
                             update_successful = True
+                            successful_tokens.add(token_name)
 
                             prices[token_name] = {
                                 'price': price,
@@ -151,13 +187,13 @@ class PriceTracker:
                                 'timestamp': time.time()
                             }
 
-                            logger.info(f"{token_name}: Price=${price:.8f}, Value=${value:.2f}")
+                            logger.info(f"Successfully updated {token_name}: Price=${price:.8f}, Value=${value:.2f}")
                             break  # Success, exit retry loop
 
                         except Exception as e:
-                            logger.error(f"Error processing {token_name}: {str(e)}")
-                            if attempt < max_retries - 1:
-                                time.sleep(retry_delay)
+                            logger.error(f"Error processing {token_name} on attempt {attempt}: {str(e)}")
+                            if attempt < len(retry_delays):
+                                time.sleep(delay)
                                 continue
                             break
 
@@ -168,15 +204,17 @@ class PriceTracker:
                     }
 
                     logger.info(f"Broadcasting update. Total value: ${total_value:.2f}")
+                    logger.info(f"Successfully updated tokens: {', '.join(successful_tokens)}")
                     socketio.emit('price_update', market_data)
                 else:
                     logger.error("No valid prices fetched in this cycle")
 
             except Exception as e:
                 logger.error(f"Update loop error: {str(e)}")
+                logger.exception("Detailed traceback:")
 
             finally:
-                # Add random delay between 3-5 seconds to avoid rate limiting
+                # Random delay between 3-5 seconds
                 delay = 3 + (hash(str(time.time())) % 3)
                 time.sleep(delay)
 
@@ -190,21 +228,24 @@ def index():
 @socketio.on('connect')
 def handle_connect():
     """Handle client connection"""
-    logger.info('Client connected')
+    logger.info('[WebSocket] Client connected')
     emit('status', {'message': 'Connected to price feed'})
 
 @socketio.on('disconnect')
 def handle_disconnect():
     """Handle client disconnection"""
-    logger.info('Client disconnected')
+    logger.info('[WebSocket] Client disconnected')
 
 def initialize_app():
     """Initialize the application and start the price tracker"""
     try:
         logger.info("Initializing price tracker...")
         
+        # Create price tracker instance
+        price_tracker = PriceTracker()
+        
         # Start price update thread
-        price_thread = Thread(target=PriceTracker.update_prices)
+        price_thread = Thread(target=price_tracker.update_prices)
         price_thread.daemon = True
         price_thread.start()
         
@@ -212,6 +253,7 @@ def initialize_app():
         return True
     except Exception as e:
         logger.error(f"Failed to initialize application: {str(e)}")
+        logger.exception("Detailed traceback:")
         return False
 
 if __name__ == '__main__':
